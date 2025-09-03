@@ -100,14 +100,15 @@ def uart1_listener_thread():
             rospy.logwarn(f"[UART1 RX] error: {e}")
             time.sleep(0.1)
 
-def x_control(topic='/have_to_move_x', i2c_addr=None, tx_cooldown=0.20, rate_hz=20):
+def x_control(topic='/have_to_move_x', i2c_addr=None, tx_cooldown=0.20, stop_hold=0.6, rate_hz=20):
     if i2c_addr is None:
         i2c_addr = I2C_ADDR3
     prev_cmd = None
     last_tx  = 0.0
+    stop_since = None
     done = False
     def cb(msg: Int32):
-        nonlocal prev_cmd, last_tx,done
+        nonlocal prev_cmd, last_tx, stop_since, done
         v = int(msg.data)
         cmd = 'w' if v > 0 else ('s' if v < 0 else 'q')
         now = time.time()
@@ -116,17 +117,20 @@ def x_control(topic='/have_to_move_x', i2c_addr=None, tx_cooldown=0.20, rate_hz=
             prev_cmd = cmd
             last_tx  = now
         if cmd == 'q':
-            done = True
+            if stop_since is None:
+                stop_since = now
+            elif (now - stop_since) >= stop_hold:
+                done = True
+        else:
+            stop_since = None
     sub = rospy.Subscriber(topic, Int32, cb, queue_size=1)
     r = rospy.Rate(rate_hz)
     try:
         while not rospy.is_shutdown() and not done:
             r.sleep()
     finally:
-        try: 
-            sub.unregister()
-        except Exception as e:  
-            rospy.logerr(f"error while unregistering : {e}")
+        try: sub.unregister()
+        except: pass
         i2c_send_text(i2c_addr, 'q')
     return True
 
@@ -179,7 +183,7 @@ def main():
     rospy.init_node("mode1_node")
 
     global UART1_PORT, UART1_BAUD, I2C_BUS_NO, I2C_ADDR2, I2C_ADDR3
-    UART1_PORT = param("uart1_port",  "/dev/ttyACM0")
+    UART1_PORT = param("uart1_port",  "/dev/ttyTHS1")
     UART1_BAUD = param("uart1_baud",  9600)
     I2C_BUS_NO = param("i2c_bus_no",  1)
     I2C_ADDR2  = param("arduino2_addr", 0x18)
@@ -227,7 +231,7 @@ def main():
 
     # this is for human control. now, we don't have a function to change manual_command, so this code never works.
     # when auto control doesn't work, we have to revive this code.
-   
+    
     try:
         '''
         while not rospy.is_shutdown():
