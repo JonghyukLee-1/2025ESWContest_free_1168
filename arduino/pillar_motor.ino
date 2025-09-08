@@ -1,82 +1,194 @@
-// ============================
-// UART 버전 (I2C → UART 치환)
-// ============================
+#include <Encoder.h>
+#include <Servo.h>
 
-#define I2C_ADDR 0x18   // (사용 안 함, 호환을 위해 남겨둠)
+// ===== 모터 핀 =====
+#define IN1 4
+#define IN2 5
+#define ENA 6
+#define IN3 8
+#define IN4 9
+#define ENB 11
 
-// ===== Pins =====
-const uint8_t ENA = 5;   // PWM
-const uint8_t IN1 = 6;
-const uint8_t IN2 = 7;
-const uint8_t ENB = 10;  // PWM
-const uint8_t IN3 = 8;
-const uint8_t IN4 = 9;
+// ===== 엔코더 핀 =====
+#define LEFT_Y 2
+#define LEFT_G 7
 
-// ===== RX buffers =====
-char     cmd_buf[32];   // 처리용 버퍼
+// ===== 서보 핀 =====
+#define SERVO_PIN 3
 
-// ===== Motor helpers =====
-inline void pillarUp()    { analogWrite(ENA, 255); digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH);  }
-inline void pillarDown()  { analogWrite(ENA, 255); digitalWrite(IN1, HIGH);  digitalWrite(IN2, LOW); }
-inline void pillarStop()  { analogWrite(ENA, 0);   digitalWrite(IN1, LOW);  digitalWrite(IN2, LOW);  }
-inline void shootStart()  { analogWrite(ENB, 255); digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);  }
-inline void shootStop()   { analogWrite(ENB, 0);   digitalWrite(IN3, LOW);  digitalWrite(IN4, LOW);  }
-inline void shootReverse(){ analogWrite(ENB, 0);   digitalWrite(IN3, LOW);  digitalWrite(IN4, HIGH); }
+Encoder myEnc(LEFT_Y, LEFT_G);
+Servo servo;
 
-// ---- utils ----
-static void sanitize(char* s, uint8_t& n) {
-  while (n && (s[n-1]=='\r' || s[n-1]=='\n' || s[n-1]==' ' || s[n-1]=='\t')) n--;
-  s[n] = '\0';
-  for (uint8_t i=0; i<n; ++i) { char c=s[i]; if (c>='A' && c<='Z') s[i]=c-'A'+'a'; }
-}
-static bool equals(const char* a, const char* b) {
-  while (*a && *b) { if (*a++ != *b++) return false; }
-  return *a==0 && *b==0;
-}
+// ===== 파라미터 =====
+int SPEED = 95;
+int BIGSPEED = 120;
+int SMALLSPEED = 20;
 
-// ---- UART line reader (\n / \r\n 기준) ----
-bool readSerialLine(char* out, uint8_t out_size, uint8_t& out_len) {
-  static char buf[32];
+// ===== 상태 =====
+volatile bool g_stopRequested = false;
+volatile bool g_hasCmd = false;
+String g_lastCmd = "";
+volatile bool g_completeFlag = false;  // (UART에서는 COMPLETE를 즉시 println)
+
+// ===== 프로토타입 =====
+void forward();
+void backward();
+void stopMotors();
+void right();
+void left();
+void moveServoToAndBack(int angle);
+void handleCommand(const String& cmd);
+
+// ---- UART 라인 리더: \n 기준으로 한 줄 읽기
+bool readSerialLine(String &out) {
+  static char buf[64];
   static uint8_t idx = 0;
 
   while (Serial.available() > 0) {
     char c = (char)Serial.read();
-
     if (c == '\n' || c == '\r') {
-      if (idx == 0) continue;         // 빈 줄 무시
-      uint8_t n = idx;
-      if (n >= out_size) n = out_size - 1;
-      for (uint8_t i=0; i<n; ++i) out[i] = buf[i];
-      out[n] = '\0';
-      out_len = n;
+      if (idx == 0) continue;    // 빈 줄 무시
+      buf[idx] = '\0';
+      out = String(buf);
       idx = 0;
       return true;
     }
-
     if (idx < sizeof(buf) - 1) buf[idx++] = c;
   }
   return false;
 }
 
 void setup() {
-  pinMode(ENA, OUTPUT); pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT);
-  pinMode(ENB, OUTPUT); pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT);
-  pillarStop(); shootStop();
+  // ==== UART 시작 (보레이트 필요 시 호스트와 동일하게) ====
+  Serial.begin(9600);
 
-  Serial.begin(9600);  // 호스트와 동일 보레이트로 설정
+  pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT); pinMode(ENA, OUTPUT);
+  pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT); pinMode(ENB, OUTPUT);
+
+  servo.attach(SERVO_PIN);
+  servo.write(0);
+
+  stopMotors();
 }
 
 void loop() {
-  uint8_t n = 0;
-  if (readSerialLine(cmd_buf, sizeof(cmd_buf), n)) {
-    sanitize(cmd_buf, n);
-
-    if      (equals(cmd_buf, "up"))           pillarUp();
-    else if (equals(cmd_buf, "down"))         pillarDown();
-    else if (equals(cmd_buf, "pillar_stop"))  pillarStop();
-    else if (equals(cmd_buf, "shoot"))        shootStart();
-    else if (equals(cmd_buf, "shoot_stop"))   shootStop();
-    else if (equals(cmd_buf, "shoot_rev"))    shootReverse();
-    // 그 외는 무시
+  // 새 명령 수신
+  String cmd;
+  if (readSerialLine(cmd)) {
+    cmd.trim();
+    if (cmd.length()) {
+      noInterrupts();
+      g_lastCmd = cmd;
+      g_hasCmd = true;
+      interrupts();
+    }
   }
+
+  if (g_hasCmd) {
+    noInterrupts();
+    String c = g_lastCmd;
+    g_hasCmd = false;
+    interrupts();
+    handleCommand(c);
+  }
+}
+
+void handleCommand(const String& cmd) {
+  if (!cmd.length()) return;
+
+  if (cmd.equalsIgnoreCase("w")) { forward(); return; }
+  if (cmd.equalsIgnoreCase("s")) { backward(); return; }
+  if (cmd.equalsIgnoreCase("a")) { left(); return; }
+  if (cmd.equalsIgnoreCase("d")) { right(); return; }
+  if (cmd.equalsIgnoreCase("q")) { stopMotors(); return; }
+
+  if (cmd.equalsIgnoreCase("STOP")) {
+    g_stopRequested = true;
+    return;
+  }
+
+  if (cmd.length() >= 2 && (cmd[0]=='V' || cmd[0]=='v')) {
+    int v = cmd.substring(1).toInt();
+    SPEED = constrain(v, 0, 255);
+    return;
+  }
+
+  if (cmd[0]=='b') {
+    int deg = cmd.substring(1).toInt();
+    moveServoToAndBack(deg);
+    return;
+  }
+
+  bool allDigits = true;
+  for (uint16_t i=0;i<cmd.length();++i) {
+    if (!isDigit(cmd[i])) { allDigits = false; break; }
+  }
+  if (allDigits) {
+    moveServoToAndBack(cmd.toInt());
+    return;
+  }
+}
+
+/* =========================
+ * 모터 제어
+ * ========================= */
+void forward() {
+  digitalWrite(IN1, LOW);  digitalWrite(IN2, HIGH);  analogWrite(ENA, SPEED);
+  digitalWrite(IN3, LOW);  digitalWrite(IN4, HIGH);  analogWrite(ENB, SPEED);
+}
+
+void backward() {
+  digitalWrite(IN1, HIGH);   digitalWrite(IN2, LOW); analogWrite(ENA, SPEED+5);
+  digitalWrite(IN3, HIGH);   digitalWrite(IN4, LOW); analogWrite(ENB, SPEED+5);
+}
+
+void stopMotors() {
+  digitalWrite(IN1, LOW);   digitalWrite(IN2, LOW);  analogWrite(ENA, 0);
+  digitalWrite(IN3, LOW);   digitalWrite(IN4, LOW);  analogWrite(ENB, 0);
+}
+
+void right() {
+  digitalWrite(IN1, LOW);   digitalWrite(IN2, HIGH); analogWrite(ENA, BIGSPEED);
+  digitalWrite(IN3, LOW);   digitalWrite(IN4, HIGH); analogWrite(ENB, SMALLSPEED);
+}
+
+void left() {
+  digitalWrite(IN1, LOW);   digitalWrite(IN2, HIGH); analogWrite(ENA, SMALLSPEED);
+  digitalWrite(IN3, LOW);   digitalWrite(IN4, HIGH); analogWrite(ENB, BIGSPEED);
+}
+
+/* =========================
+ * 서보 제어
+ * - 완료 후 "COMPLETE" 한 줄 출력
+ * - 동작 중 "STOP" 수신 시 즉시 중단
+ * ========================= */
+void moveServoToAndBack(int angle) {
+  angle = constrain(angle, 0, 180);
+
+  for (int a = 0; a <= angle; ++a) {
+    // 동작 중 STOP 수신 체크
+    String s;
+    if (readSerialLine(s)) {
+      s.trim();
+      if (s.equalsIgnoreCase("STOP")) g_stopRequested = true;
+    }
+    if (g_stopRequested) { g_stopRequested = false; return; }
+
+    servo.write(a);
+    delay(30);
+  }
+  for (int a = angle; a >= 0; --a) {
+    String s;
+    if (readSerialLine(s)) {
+      s.trim();
+      if (s.equalsIgnoreCase("STOP")) g_stopRequested = true;
+    }
+    if (g_stopRequested) { g_stopRequested = false; return; }
+
+    servo.write(a);
+    delay(30);
+  }
+
+  // UART에서는 요청-응답이 없으므로 완료를 즉시 알림
+  Serial.println("COMPLETE");
 }
