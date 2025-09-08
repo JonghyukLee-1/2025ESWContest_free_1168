@@ -1,6 +1,8 @@
-#include <Wire.h>
+// ============================
+// UART 버전 (I2C → UART 치환)
+// ============================
 
-#define I2C_ADDR 0x18
+#define I2C_ADDR 0x18   // (사용 안 함, 호환을 위해 남겨둠)
 
 // ===== Pins =====
 const uint8_t ENA = 5;   // PWM
@@ -10,20 +12,16 @@ const uint8_t ENB = 10;  // PWM
 const uint8_t IN3 = 8;
 const uint8_t IN4 = 9;
 
-// ===== RX buffers (ISR-safe) =====
-volatile bool     rx_ready = false;
-volatile uint8_t  rx_len   = 0;
-volatile char     rx_buf[32];
-
-char cmd_buf[32];  // processed in loop
+// ===== RX buffers =====
+char     cmd_buf[32];   // 처리용 버퍼
 
 // ===== Motor helpers =====
-inline void pillarUp()    { analogWrite(ENA, 255); digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);  }
-inline void pillarDown()  { analogWrite(ENA, 255); digitalWrite(IN1, LOW);  digitalWrite(IN2, HIGH); }
+inline void pillarUp()    { analogWrite(ENA, 255); digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH);  }
+inline void pillarDown()  { analogWrite(ENA, 255); digitalWrite(IN1, HIGH);  digitalWrite(IN2, LOW); }
 inline void pillarStop()  { analogWrite(ENA, 0);   digitalWrite(IN1, LOW);  digitalWrite(IN2, LOW);  }
 inline void shootStart()  { analogWrite(ENB, 255); digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);  }
 inline void shootStop()   { analogWrite(ENB, 0);   digitalWrite(IN3, LOW);  digitalWrite(IN4, LOW);  }
-inline void shootReverse(){ analogWrite(ENB, 0);   digitalWrite(IN3, LOW);  digitalWrite(IN4, HIGH);  }
+inline void shootReverse(){ analogWrite(ENB, 0);   digitalWrite(IN3, LOW);  digitalWrite(IN4, HIGH); }
 
 // ---- utils ----
 static void sanitize(char* s, uint8_t& n) {
@@ -36,19 +34,28 @@ static bool equals(const char* a, const char* b) {
   return *a==0 && *b==0;
 }
 
-// ---- I2C ISRs ----
-void onI2CReceive(int) {
-  uint8_t i=0;
-  while (Wire.available() && i < sizeof(rx_buf)-1) rx_buf[i++] = (char)Wire.read();
-  while (Wire.available()) (void)Wire.read();  // flush extras
-  rx_buf[i]='\0';
-  rx_len=i;
-  rx_ready=true;
-}
+// ---- UART line reader (\n / \r\n 기준) ----
+bool readSerialLine(char* out, uint8_t out_size, uint8_t& out_len) {
+  static char buf[32];
+  static uint8_t idx = 0;
 
-void onI2CRequest() {
-  // 간단 상태 1바이트 응답: 최근에 명령 수신했는지
-  Wire.write(rx_ready ? 1 : 0);
+  while (Serial.available() > 0) {
+    char c = (char)Serial.read();
+
+    if (c == '\n' || c == '\r') {
+      if (idx == 0) continue;         // 빈 줄 무시
+      uint8_t n = idx;
+      if (n >= out_size) n = out_size - 1;
+      for (uint8_t i=0; i<n; ++i) out[i] = buf[i];
+      out[n] = '\0';
+      out_len = n;
+      idx = 0;
+      return true;
+    }
+
+    if (idx < sizeof(buf) - 1) buf[idx++] = c;
+  }
+  return false;
 }
 
 void setup() {
@@ -56,21 +63,12 @@ void setup() {
   pinMode(ENB, OUTPUT); pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT);
   pillarStop(); shootStop();
 
-  Wire.begin(I2C_ADDR);
-  Wire.onReceive(onI2CReceive);
-  Wire.onRequest(onI2CRequest);
+  Serial.begin(9600);  // 호스트와 동일 보레이트로 설정
 }
 
 void loop() {
-  if (rx_ready) {
-    noInterrupts();
-    uint8_t n = rx_len;
-    if (n >= sizeof(cmd_buf)) n = sizeof(cmd_buf)-1;
-    for (uint8_t i=0;i<n;++i) cmd_buf[i]=rx_buf[i];
-    cmd_buf[n]='\0';
-    rx_ready=false;
-    interrupts();
-
+  uint8_t n = 0;
+  if (readSerialLine(cmd_buf, sizeof(cmd_buf), n)) {
     sanitize(cmd_buf, n);
 
     if      (equals(cmd_buf, "up"))           pillarUp();
