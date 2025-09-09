@@ -1,5 +1,4 @@
 #!/home/tunnel/jetson_project/yolov_env/bin/python
-# -*- coding: utf-8 -*-
 
 import rospy, time, sys, termios, tty, threading
 from std_msgs.msg import Bool, String
