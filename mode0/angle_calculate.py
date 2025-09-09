@@ -1,106 +1,81 @@
- import serial, time, numpy as np, re
+# angle_calculate.py
+import serial, time, re, math
 import rospy
 
-
-pillar_height = 63.0
-distance_cm = 999.0
-_arduino = None
-
-_READY_PATTERNS = (b'READY', b'Ready', b'DIST,')
 _NUM_RE = re.compile(r'^-?\d+(\.\d+)?$')
 
 def _wait_ready_lines(ser, timeout=2.0):
-    t0 = time.time()
-    buf = b""
+    t0, buf = time.time(), b""
     while time.time() - t0 < timeout:
-        chunk = ser.read(64)
+        try:
+            chunk = ser.read(64)
+        except Exception:
+            break
         if chunk:
             buf += chunk
-            if any(p in buf for p in _READY_PATTERNS):
+            if (b'READY' in buf) or (b'Ready' in buf) or (b'DIST,' in buf):
                 return True
         time.sleep(0.02)
     return False
 
 def open_arduino(port='/dev/ttyACM0', baud=9600, timeout=0.2):
-    global _arduino
-    if _arduino is None or not _arduino.is_open:
-        _arduino = serial.Serial(port, baud, timeout=timeout)
-        time.sleep(2.0)
-        _arduino.reset_input_buffer()
-        _arduino.reset_output_buffer()
-        _wait_ready_lines(_arduino, timeout=2.0)
-    return _arduino
-
-def close_arduino():
-    global _arduino
-    if _arduino and _arduino.is_open:
-        _arduino.close()
-    _arduino = None
-
-def _parse_distance(line: str):
-    line = line.strip()
-    if not line:
-        return None
-    if line[:5].upper() == "DIST,":
-        token=line.split(",",1)[1].strip()
-    else:
-        token = line
-    #token = line.split(",", 1)[1].strip() if line.startswith("DIST,") else line
-    if not _NUM_RE.match(token):
-        return None
+    """Opens serial connection to Arduino and waits for it to be ready."""
+    ser = serial.Serial(port, baud, timeout=timeout)
+    time.sleep(2.0)  # Wait for auto-reset
     try:
-        return float(token)
+        ser.reset_input_buffer(); ser.reset_output_buffer()
     except Exception:
-        return None
+        pass
+    _wait_ready_lines(ser, timeout=2.0)
+    return ser
 
-def listen_from_arduino(max_wait=1.0, ser=None, port='/dev/ttyACM0', baud=9600, timeout=0.2):
-    global distance_cm
-    s = ser if ser is not None else open_arduino(port, baud, timeout)
-    # drain current buffer so we only read fresh data
+def close_arduino(ser):
+    """Closes serial connection safely."""
     try:
-        n = s.in_waiting
-        if n:
-            s.read(n)
-    except:
+        if ser and ser.is_open:
+            ser.close()
+    except Exception:
         pass
 
-    t0 = time.time()
-    while (time.time() - t0) < max_wait:
+def _drain(ser):
+    """Drains any waiting data from the serial buffer."""
+    if hasattr(ser, "in_waiting"):
         try:
-            line = s.readline().decode('utf-8', errors='ignore')
-            if not line:
-                time.sleep(0.01)
-                continue
-            val = _parse_distance(line)
-            if val is not None:
-                distance_cm = val
-                rospy.loginfo(distance_cm)
-                return distance_cm
-        except Exception as e:
-            rospy.logwarn(f"serial read error : {e}")
-            time.sleep(0.05)
-            break
+            n = ser.in_waiting
+            if n: ser.read(n)
+        except Exception:
+            pass
+
+def _parse_distance(line: str):
+    if not line: return None
+    line = line.strip()
+    token = line.split(",", 1)[1].strip() if line[:5].upper() == "DIST," else line
+    if not _NUM_RE.match(token): return None
+    try: return float(token)
+    except Exception: return None
+
+def listen_from_arduino(ser, max_wait=1.0):
+    """Listens for a single distance measurement (cm) from the serial port."""
+    if ser is None: return None
+    _drain(ser)
+    t0 = time.time()
+    while time.time() - t0 < max_wait and not rospy.is_shutdown():
+        try:
+            line = ser.readline().decode('utf-8', errors='ignore').strip()
+        except Exception:
+            line = ""
+        if not line:
+            time.sleep(0.01); continue
+        val = _parse_distance(line)
+        if val is not None:
+            rospy.loginfo(val)
+            return val
     return None
 
-def get_angle(d_cm):
-    """Convert distance(cm) to servo angle (0~180)"""
-    try:
-        d = float(d_cm)
-        if d <= 0:
-            return None
-        angle_rad = np.arctan(pillar_height / d)
-        angle_deg = np.degrees(angle_rad)
-        if ( 0.0 <= angle_deg <=180.0 ):
-            return angle_deg
-        else:
-            return None
-    except:
-        return None
-
-def angle_to_pwm(angle_deg, min_pwm=0, max_pwm=255):
-    """Map servo angle (0~180) to PWM value (0~255)"""
-    if angle_deg is None:
-        return None
-    angle_deg = max(0, min(180, angle_deg))
-    pwm_val = int(min_pwm + (angle_deg / 180.0) * (max_pwm - min_pwm))
-    return pwm_val
+def get_angle(distance_cm: float, pillar_height: float = 63.0,
+             min_deg: int = 0, max_deg: int = 180) -> int:
+    """Calculates servo angle (deg): atan2(h, d), clamped to [min,max]."""
+    if distance_cm is None or distance_cm <= 0:
+        return max_deg
+    ang = int(round(math.degrees(math.atan2(float(pillar_height), float(distance_cm)))))
+    return max(min(ang, max_deg), min_deg)
