@@ -55,33 +55,36 @@ mode3_node.py: 모드 3의 메인 로직으로, 복귀 경로를 계산하고 �
 
 arm_control.py: 로봇팔을 초기 위치로 되돌리는 작업을 수행한다.
 
----
-## 디렉터리 구조
+
+### 디렉터리 구조
 
 ```text
 .
 ├── .vscode
-│   ├── settings.json
+│   └── settings.json
 ├── arduino
 │   ├── car_motor.py
 │   ├── nozzle_motor.py
-│   ├── pillar_motor.py
+│   └── pillar_motor.py
 ├── mode0
 │   ├── mode0_node.py
-│   ├── angle_calculate.py
+│   └── angle_calculate.py
 ├── mode1
 │   ├── mode1_node.py
 │   ├── angle_calculate.py
-│   └── arm_control.py
-│   └── sound_data.py
+│   ├── arm_control.py
+│   ├── sound_data.py
 │   └── sound_test.py
 ├── mode2
 │   ├── mode2_node.py
-│   └── arm_control.py
+│   ├── arm_control.py
 │   └── camera_path.py
 ├── mode3
 │   ├── mode3_node.py
 │   └── arm_control.py
 ├── mode_select.py
-└── README.md
+├── README.md
+└── requirements.txt
 
+# 시연 영상
+https://www.youtube.com/watch?v=OCkE4dl99yQ
