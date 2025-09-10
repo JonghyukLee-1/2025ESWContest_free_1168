@@ -13,7 +13,7 @@
 
 - 모듈화된 시스템: 전체 시스템은 여러 모드로 나뉜 상태 머신에 의해 제어되며, 각 모드는 특정 임무를 수행하고 임무 완료 시 다음 모드로 전환된다.
 
-# 시스템 아키텍처
+## 시스템 아키텍처
 - 메인 컨트롤러: Jetson Nano
 
 - 하드웨어 제어: Arduino와 Jetson GPIO, Serial 및 UART 통신 활용
@@ -22,7 +22,7 @@
 
 - 통신 프로토콜: ROS Topics, Serial, UART
 
-# 모드별 동작 및 코드 설명
+## 모드별 동작 및 코드 설명
 - mode 0 <열화상 카메라 구동 및 주행 시작>
 
 mode0_node.py: 모드 0의 메인 로직을 담당하며, 열화상 카메라 데이터를 받아 분석 후 다음 모드로 전환하는 신호를 보낸다.
@@ -54,3 +54,33 @@ arm_control.py: 생성된 경로를 따라 팔의 회전 등 움직임을 제어
 mode3_node.py: 모드 3의 메인 로직으로, 복귀 경로를 계산하고 로봇을 제어한다.
 
 arm_control.py: 로봇팔을 초기 위치로 되돌리는 작업을 수행한다.
+
+---
+## 디렉터리 구조
+
+```text
+.
+├── .vscode
+│   ├── settings.json
+├── arduino
+│   ├── car_motor.py
+│   ├── nozzle_motor.py
+│   ├── pillar_motor.py
+├── mode0
+│   ├── mode0_node.py
+│   ├── angle_calculate.py
+├── mode1
+│   ├── mode1_node.py
+│   ├── angle_calculate.py
+│   └── arm_control.py
+│   └── sound_data.py
+│   └── sound_test.py
+├── mode2
+│   ├── mode2_node.py
+│   └── arm_control.py
+│   └── camera_path.py
+├── mode3
+│   ├── mode3_node.py
+│   └── arm_control.py
+├── README.md
+└── mode_select.py
