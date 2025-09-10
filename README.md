@@ -82,8 +82,6 @@ arm_control.py: 로봇팔을 초기 위치로 되돌리는 작업을 수행한�
 ├── mode3
 │   ├── mode3_node.py
 │   └── arm_control.py
-├── README.md
-└── mode_select.py
+├── mode_select.py
+└── README.md
 
-# 시연 영상
-<https://www.youtube.com/watch?v=ep7Klf0uMPo>
