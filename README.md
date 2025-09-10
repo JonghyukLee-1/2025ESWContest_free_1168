@@ -41,7 +41,7 @@ sound_data.py: 마이크를 통해 수집된 타격음 데이터를 처리한다
 
 sound_test.py: 처리한 타격음 데이터를 바탕으로 타일의 이상/정상 상태를 판단한다.
 
-- 모드 2 <경로 생성 및 유지·보수 작업>
+- mode 2 <경로 생성 및 유지·보수 작업>
 
 mode2_node.py: 모드 2의 메인 로직으로, camera_path.py를 활용해 경로를 생성하며 타일 유지·보수 작업을 진행한다.
 
@@ -49,7 +49,7 @@ camera_path.py: 카메라를 통해 이상 타일의 경계를 따라 경로를 
 
 arm_control.py: 생성된 경로를 따라 팔의 회전 등 움직임을 제어한다.
 
-- 모드 3 <원위치 복귀>
+- mode 3 <정상 주행 상태로 복귀>
 
 mode3_node.py: 모드 3의 메인 로직으로, 복귀 경로를 계산하고 로봇을 제어한다.
 
@@ -85,6 +85,7 @@ arm_control.py: 로봇팔을 초기 위치로 되돌리는 작업을 수행한�
 ├── mode_select.py
 ├── README.md
 └── requirements.txt
+```
 
 # 시연 영상
 https://www.youtube.com/watch?v=OCkE4dl99yQ
