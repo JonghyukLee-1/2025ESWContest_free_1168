@@ -1,9 +1,10 @@
 #!/home/tunnel/jetson_project/yolov_env/bin/python
+#pillar_modified_ver
 import rospy, subprocess, time, signal, threading, os, atexit
-from std_msgs.msg import String, Int32
+from std_msgs.msg import String, Int32, Float32
 
 thermal_proc = None
-THERMAL_CMD = ["python3", "/home/tunnel/catkin_ws/src/mode0/src/thermal_code/thermal_module_ver.py"]
+THERMAL_CMD = ["python3", "/home/tunnel/catkin_ws/src/thermal_module_ver.py"]
 
 lock = threading.Lock()
 current_result = None
@@ -12,6 +13,7 @@ p1 = p2 = None
 m1_steps = None
 m2_steps = None
 pub_remain = None
+pillar_time = None
 
 _proc_registry = {}
 
@@ -31,6 +33,17 @@ def cb_steps(msg: Int32):
         rospy.loginfo(f"[MODE2] steps={v}")
     else:
         rospy.logwarn(f"[steps] late/unknown ignored (active={active_mode}, v={v})")
+
+
+def cb_pillar_time(msg: Float32):
+    global pillar_time, active_mode
+    v = float(msg.data)
+    if active_mode == 1:
+        pillar_time = v # here, pillar_up_time is saved to pillar_time(global)
+        rospy.loginfo(f"[MODE1] pillar_up_time={v:.1f}") 
+    else:
+        rospy.logwarn(f"[pillar_up_time] ignored (active={active_mode}, v={v:.1f})")
+
 
 def start_node(cmd, name):
     rospy.loginfo(f"Starting: {' '.join(cmd)}")
@@ -102,6 +115,8 @@ def main():
     rospy.init_node('mode_selector', anonymous=False)
     rospy.Subscriber('/mode_result', String, cb_result)
     rospy.Subscriber('/steps', Int32, cb_steps)
+    rospy.Subscriber('/pillar_up_time', Float32, cb_pillar_time)
+
     pub_remain = rospy.Publisher('/remain_steps', Int32, queue_size=1, latch=True)
 
     thermal_proc = start_node(THERMAL_CMD, 'thermal_module')
@@ -116,8 +131,8 @@ def main():
 
         elif mode == 1:
             with lock: active_mode = 1; m1_steps = None
-            p1 = start_node(['rosrun','mode1','mode1_node_ver2.py','__name:=mode1_node'], 'mode1')
-            res = wait_result(300.0, {'normal','abnormal'})
+            p1 = start_node(['rosrun','mode1','mode1_node.py','__name:=mode1_node'], 'mode1')
+            res = wait_result(1800.0, {'normal','abnormal'})
             t0 = time.time()
             while m1_steps is None and p1.poll() is None and time.time()-t0 < 1.0:
                 time.sleep(0.05)
@@ -126,7 +141,8 @@ def main():
             with lock: active_mode = 0
             if res == 'normal': mode = 3
             elif res == 'abnormal': mode = 2
-            else: rospy.logwarn("[MODE1] timeout/unexpected ¡æ mode0"); mode = 0
+            elif res == 'None' : mode = 2 # just for test, before we make real sound_code
+            else: rospy.logwarn("[MODE1] timeout/unexpected 횂징횄짝 mode0"); mode = 0
 
         elif mode == 2:
             with lock: active_mode = 2; m2_steps = None
@@ -143,6 +159,14 @@ def main():
         elif mode == 3:
             p = start_node(['rosrun','mode3','mode3_node.py','__name:=mode3_node'], 'mode3')
             publish_remain_and_reset()
+            time.sleep(0.2)
+            if pillar_time is not None:
+                pub_pillar = rospy.Publisher('/pillar_down_time',Float32,queue_size=1,latch=True)
+                rospy.sleep(0.1)
+                pub_pillar.publish(Float32(pillar_time))
+                rospy.loginfo(f"published pillar_down_time = {pillar_time :.1f}")
+            else:
+                rospy.loginfo(f"pillar down time is none.")
             time.sleep(0.2)
             res = wait_result(60.0, {'reset'})
             stop_node(p, 'mode3')
