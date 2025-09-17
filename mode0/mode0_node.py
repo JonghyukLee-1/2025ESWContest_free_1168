@@ -1,4 +1,5 @@
 #!/home/tunnel/jetson_project/yolov_env/bin/python
+# -*- coding: utf-8 -*-
 
 import rospy, time, sys, termios, tty, threading
 from std_msgs.msg import Bool, String
@@ -7,21 +8,22 @@ from angle_calculate import (
     open_arduino, close_arduino, listen_from_arduino, get_angle
 )
 
-# ===== Constants / Pin Definitions =====
-a1_port = "/dev/ttyACM0"    # Arm Arduino (servo)
-a3_port = "/dev/ttyTHS1"    # Car Arduino (w,s,q, bNN)
-baud    = 9600
+# ===== UART configuration =====
+a1_port = "/dev/ttyACM0"   # Arm Arduino (ultrasonic sensor + servo angle control)
+a3_port = "/dev/ttyTHS1"   # Car Arduino (drive commands: w,s,q, bNN)
+baud   = 9600
 
-# ===== Variables =====
-A1 = None   # Servo handle
-A3 = None   # Car handle
+# ===== Global handles =====
+A1 = None  # Arm Arduino handle
+A3 = None  # Car Arduino handle
 stop_event = False
 manual_mode = False
 thermal_triggered = False
 mode_pub = None
 
-# ===== Helpers (common) =====
+# ===== UART helpers =====
 def uart_send(ser, cmd: str):
+    """Send a command string over UART (with newline)."""
     if ser is None:
         rospy.logwarn(f"[UART] handle=None, skip TX: {cmd}")
         return
@@ -32,7 +34,10 @@ def uart_send(ser, cmd: str):
         rospy.logwarn(f"[UART] send failed: {e}")
 
 def wait_complete(ser, timeout=5.0, interval=0.1) -> bool:
-    """Wait for 'COMPLETE' message from the serial port."""
+    """
+    Wait for a 'COMPLETE' response from Arduino.
+    Returns True if received within timeout.
+    """
     if ser is None: return False
     t0 = time.time()
     while time.time() - t0 < timeout and not stop_event and not rospy.is_shutdown():
@@ -45,9 +50,12 @@ def wait_complete(ser, timeout=5.0, interval=0.1) -> bool:
         time.sleep(interval)
     return False
 
-# ===== Callbacks / Handlers =====
+# ===== Callbacks =====
 def thermal_callback(msg: Bool):
-    """Emergency stop on thermal flag True + publish 'found' state."""
+    """
+    Triggered when the thermal node detects a hot spot.
+    Emergency stop + publish 'found'.
+    """
     global thermal_triggered, stop_event, mode_pub
     if msg.data:
         thermal_triggered = True
@@ -59,7 +67,12 @@ def thermal_callback(msg: Bool):
             mode_pub.publish("found")
 
 def move_servo_auto():
-    """A1: for servo angle, A3: bNN command + wait for COMPLETE."""
+    """
+    Automatic servo control:
+    - A1: read ultrasonic distance
+    - Convert to angle
+    - A3: send servo angle command (bNN) and wait for COMPLETE
+    """
     if stop_event:
         return
     dist = listen_from_arduino(A1, max_wait=1.0)
@@ -73,7 +86,10 @@ def move_servo_auto():
         rospy.logwarn("[AUTO] servo COMPLETE timeout or interrupted")
 
 def move_car_forward():
-    """Simple forward movement for a short duration."""
+    """
+    Move the car forward for 2 seconds,
+    then stop (send 'w' then 'q').
+    """
     if stop_event or manual_mode:
         return
     uart_send(A3, 'w')
@@ -82,6 +98,7 @@ def move_car_forward():
     time.sleep(0.2)
 
 def _get_key():
+    """Get one key press from stdin (non-blocking raw mode)."""
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
     try:
@@ -92,7 +109,13 @@ def _get_key():
     return ch
 
 def keyboard_listener():
-    """m: toggle manual mode, space: stop(q), x: emergency stop, wasdq: movement"""
+    """
+    Keyboard teleop:
+    - m: toggle manual_mode
+    - space: stop (q)
+    - x: emergency stop
+    - wasdq: direct motor control
+    """
     global manual_mode, stop_event
     rospy.loginfo("[KEY] Listener started")
     while not rospy.is_shutdown():
@@ -117,6 +140,12 @@ def keyboard_listener():
             uart_send(A3, key)
 
 def auto_mode_loop():
+    """
+    Automatic mode loop:
+    - Move servo based on ultrasonic distance
+    - Move car forward
+    - Repeat until stop/manual/thermal event
+    """
     rate = rospy.Rate(10)
     rospy.loginfo("[AUTO] Loop started")
     while not rospy.is_shutdown():
@@ -128,7 +157,7 @@ def auto_mode_loop():
         move_car_forward()
         rate.sleep()
 
-# ===== Main =====
+# ===== Main entry =====
 def main():
     global A1, A3, mode_pub
     rospy.init_node('mode0_node', anonymous=True)
