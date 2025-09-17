@@ -1,272 +1,226 @@
 #!/home/tunnel/jetson_project/yolov_env/bin/python
-
+# pillar_modified_ver
 import rospy
-import serial
 import threading
 import time
-from std_msgs.msg import String, Float32, Int32
+import sys
+import serial
+from std_msgs import msg as std_msgs
+from std_msgs.msg import String, Int32, Float32
 
-from arm_control import (go_mode, abnormal_mode, normal_mode, quit_mode, for_step_publish)
-from angle_calculate import listen_from_arduino, close_arduino
+# ===== UART Port Config =====
+A1 = "/dev/ttyACM0"  # Arm Arduino(go/abnoraml/normal/quit/(1,F,30,5)/(2,F,30,90))
+A2 = "/dev/ttyACM1"  # Pillar Arduino (up/down/pillar_stop)
+A3 = "/dev/ttyTHS1"  # Car  Arduino (drive: w/s/q, bxx)
+UART_BAUD = 9600
+
+# Serial handles (open at startup)
+A1_SER = None
+A2_SER = None
+A3_SER = None
+
+# External helpers (already UART-based in your baseline)
+from arm_control import (open_serial, close_serial, go_mode, quit_mode, uart_send, init_pub)
 from sound_data import sound_data
 
-try:
-    from smbus2 import SMBus
-except ImportError:
-    SMBus = None
+# ===== Globals =====
+sound_pub = None
+pillar_time_pub = None
+_emergency_evt = threading.Event()
 
 def param(name, default):
     return rospy.get_param("~" + name, default)
 
-UART1_PORT = None
-UART1_BAUD = 9600
-
-I2C_BUS_NO = 1
-I2C_ADDR2  = 0x18  # pillar/slide
-I2C_ADDR3  = 0x06 # W/S drive (confirmed)
-
-CENTER_DEADBAND = 3.0
-CENTER_COOLDOWN = 0.15
-
-manual_lock = threading.Lock()
-manual_command = None
-
-uart1_ser = None
-i2c_bus   = None
-
-last_center_tx = 0.0
-aligned = False
-
-def open_uart(port, baud, name):
-    if not port:
-        return None
+# ---------- Emergency ----------
+def emergency_stop(reason="keyboard"):
+    """Hard stop everything we control (body + pillar), notify arm_control UART."""
     try:
-        ser = serial.Serial(port, baud, timeout=0.05)
-        time.sleep(2.0)
-        ser.reset_input_buffer()
-        ser.reset_output_buffer()
-        rospy.loginfo(f"[{name}] open {port}@{baud}")
-        return ser
+        _emergency_evt.set()
+        rospy.logwarn(f"[EMERGENCY] stop triggered ({reason})")
+        try:
+            if A1_SER: quit_mode(A1_SER)       
+            if A2_SER: uart_send(A2_SER, "pillar_stop")  
+            if A3_SER: uart_send(A3_SER, "q")            
+        except Exception as e:
+            rospy.logwarn(f"[EMERGENCY] UART notify failed: {e}")
     except Exception as e:
-        rospy.logwarn(f"[{name}] open fail: {e}")
-        return None
+        rospy.logwarn(f"[EMERGENCY] unexpected error: {e}")
 
-def i2c_send_text(addr, text):
-    if i2c_bus is None:
-        rospy.logwarn("[I2C] bus not available")
-        return
-    try:
-        data = bytearray(text.encode('ascii'))[:31]
-        payload = [c for c in data]
-        i2c_bus.write_i2c_block_data(addr, 0x00, payload)
-        rospy.loginfo(f"[I2C->0x{addr:02X}] {text}")
-    except Exception as e:
-        rospy.logwarn(f"[I2C->0x{addr:02X}] send fail: {e}")
-
-'''
-def center_callback(msg: Float32):
-    global last_center_tx, aligned
-    c = msg.data
-    now = time.time()
-    if abs(c) <= CENTER_DEADBAND:
-        aligned = True
-        return
-    aligned = False
-    if now - last_center_tx < CENTER_COOLDOWN:
-        return
-    cmd = "w" if c > 0 else "s"
-    i2c_send_text(I2C_ADDR3, cmd)
-    rospy.loginfo_throttle(1.0, f"[A3 I2C] {cmd} (center={c:.2f})")
-    last_center_tx = now
-''' # do we need this..?
-
-def uart1_listener_thread():
-    if uart1_ser is None:
-        rospy.logwarn("[UART1] listener disabled (no port)")
-        return
+"""
+def keyboard_listener_thread():
+    #type 'q' + Enter to emergency-stop
+    rospy.loginfo("[KEY] Listener started (type 'q' + Enter to emergency-stop)")
     while not rospy.is_shutdown():
         try:
-            line = uart1_ser.readline().decode(errors='ignore').strip()
+            line = sys.stdin.readline()
             if not line:
-                time.sleep(0.05)
-                continue
-            u = line.upper()
-            rospy.loginfo(f"[UART1 RX] {u}")
-            if u == "STOP":
-                rospy.loginfo("[ACTION] Slide movement complete")
-            elif u == "HIT_READY":
-                rospy.loginfo("[ACTION] Recording ready")
+                time.sleep(0.05); continue
+            if line.strip().lower() == "q":
+                emergency_stop("keyboard:q")
         except Exception as e:
-            rospy.logwarn(f"[UART1 RX] error: {e}")
+            rospy.logwarn(f"[KEY] error: {e}")
             time.sleep(0.1)
+"""
 
-def x_control(topic='/have_to_move_x', i2c_addr=None, tx_cooldown=0.20, stop_hold=0.6, rate_hz=20):
-    if i2c_addr is None:
-        i2c_addr = I2C_ADDR3
-    prev_cmd = None
-    last_tx  = 0.0
-    stop_since = None
-    done = False
+def x_control(topic='/have_to_move_x', tx_cooldown=0.20, rate_hz=20):
+    """Drive body: ROS Int32 -> w/s/q over UART (BODY)."""
+    prev_cmd, last_tx, done = None, 0.0, False
     def cb(msg: Int32):
-        nonlocal prev_cmd, last_tx, stop_since, done
+        nonlocal prev_cmd, last_tx, done
+        if _emergency_evt.is_set(): done = True; return
         v = int(msg.data)
-        cmd = 'w' if v > 0 else ('s' if v < 0 else 'q')
+        cmd = 'w' if v > 0 else ('s' if v < 0 else 'q')  # (Arduino basis)
         now = time.time()
         if cmd != prev_cmd or (now - last_tx) >= tx_cooldown:
-            i2c_send_text(i2c_addr, cmd)
-            prev_cmd = cmd
-            last_tx  = now
+            uart_send(A3_SER, cmd)
+            rospy.loginfo(f"[A3]-> {cmd}")
+            prev_cmd, last_tx = cmd, now
         if cmd == 'q':
-            if stop_since is None:
-                stop_since = now
-            elif (now - stop_since) >= stop_hold:
-                done = True
-        else:
-            stop_since = None
+            done = True
     sub = rospy.Subscriber(topic, Int32, cb, queue_size=1)
     r = rospy.Rate(rate_hz)
     try:
-        while not rospy.is_shutdown() and not done:
+        while not rospy.is_shutdown() and not done and not _emergency_evt.is_set():
             r.sleep()
     finally:
         try: sub.unregister()
         except: pass
-        i2c_send_text(i2c_addr, 'q')
-    return True
+        uart_send(A3_SER, 'q')
+    return not _emergency_evt.is_set()
 
-def y_control(topic='/have_to_move_y', i2c_addr=None, tx_cooldown=0.20, stop_hold=0.6, rate_hz=20):
-    if i2c_addr is None:
-        i2c_addr = I2C_ADDR2
-    prev_cmd = None
-    last_tx  = 0.0
-    stop_since = None
-    done = False
+def y_control(topic='/have_to_move_y', ty_cooldown=0.20, rate_hz=20):
+    """Move pillar: ROS Int32 -> up/pillar_stop over UART (PILLAR)."""
+    prev_cmd, last_ty, done = None, 0.0, False
+    up_start_time = None
     def cb(msg: Int32):
-        nonlocal prev_cmd, last_tx, stop_since, done
+        nonlocal prev_cmd, last_ty, done, up_start_time
+        if _emergency_evt.is_set(): done = True; return
         v = int(msg.data)
-        cmd = 'UP' if v > 0 else 'PILLAR_STOP'
+        # NOTE: Arduino basis (lowercase)
+        if v > 0: cmd = 'up'
+        # elif v < 0: cmd = 'down'  # enable when your flow needs it
+        else: cmd = 'pillar_stop'
         now = time.time()
-        if cmd != prev_cmd or (now - last_tx) >= tx_cooldown:
-            i2c_send_text(i2c_addr, cmd)
-            prev_cmd = cmd
-            last_tx  = now
-        if cmd == 'PILLAR_STOP':
-            if stop_since is None:
-                stop_since = now
-            elif (now - stop_since) >= stop_hold:
-                done = True
-        else:
-            stop_since = None
+        if cmd == 'up' and up_start_time is None:
+            up_start_time = now
+        if cmd == 'pillar_stop' and up_start_time is not None:
+            elapsed = now - up_start_time # here, up during time is recorded
+            elapsed_2f = round(elapsed,2)
+            rospy.loginfo(f"pillar up lasted {elapsed:.2f} sec")
+            if pillar_time_pub is not None:
+                pillar_time_pub.publish(Float32(data=elapsed_2f))
+            up_start_time = None
+            done = True
+            
+        if cmd != prev_cmd or (now - last_ty) >= ty_cooldown:
+            uart_send(A2_SER, cmd)
+            rospy.loginfo(f"[A2]-> {cmd}")
+            prev_cmd, last_ty = cmd, now
+        if cmd == 'pillar_stop':
+            done = True
     sub = rospy.Subscriber(topic, Int32, cb, queue_size=1)
     r = rospy.Rate(rate_hz)
     try:
-        while not rospy.is_shutdown() and not done:
+        while not rospy.is_shutdown() and not done and not _emergency_evt.is_set():
             r.sleep()
     finally:
         try: sub.unregister()
         except: pass
-        i2c_send_text(i2c_addr, 'PILLAR_STOP')
-    return True
+        uart_send(A2_SER, 'pillar_stop')
+    return not _emergency_evt.is_set()
 
-def run_mode1_sequence():
+# ---------- Orchestration ----------
+def run():
+    # 1) X control
     ok_x = x_control()
     if not ok_x:
-        rospy.logwarn("[MODE1] X-phase ended unexpectedly; continuing to Y-phase")
+        rospy.logwarn("[MODE1] X-phase ended (possibly emergency); continuing")
+    if _emergency_evt.is_set():
+        return False
+
+    uart_send(A3_SER, 'b00')
+    time.sleep(2.0)
+
+    try:
+        _ = rospy.wait_for_message('/have_to_move_y', Int32, timeout=8.0)
+    except rospy.ROSException:
+        rospy.logerr("[MODE1] /have_to_move_y not received in 8s -> abort")
+        emergency_stop("y_wait timeout")
+        return False
+
     ok_y = y_control()
     if not ok_y:
-        rospy.logwarn("[MODE1] Y-phase ended unexpectedly")
+        rospy.logwarn("[MODE1] Y-phase ended (possibly emergency)")
     rospy.loginfo("[MODE1] sequence complete")
-    return ok_x and ok_y
+    return (ok_x and ok_y and not _emergency_evt.is_set())
 
+# ---------- Main ----------
 def main():
-    global uart1_ser, i2c_bus
     rospy.init_node("mode1_node")
 
-    global UART1_PORT, UART1_BAUD, I2C_BUS_NO, I2C_ADDR2, I2C_ADDR3
-    UART1_PORT = param("uart1_port",  "/dev/ttyTHS1")
-    UART1_BAUD = param("uart1_baud",  9600)
-    I2C_BUS_NO = param("i2c_bus_no",  1)
-    I2C_ADDR2  = param("arduino2_addr", 0x18)
-    I2C_ADDR3  = param("arduino3_addr", 0x06)  # stays 0x04
 
-    uart1_ser = open_uart(UART1_PORT, UART1_BAUD, "UART1")
-    threading.Thread(target=uart1_listener_thread, daemon=True).start()
+    # Open UARTs
+    global A1_SER, A2_SER, A3_SER, sound_pub, pillar_time_pub
+    A1_SER = open_serial(A1, UART_BAUD)
+    A2_SER = open_serial(A2, UART_BAUD)
+    A3_SER = open_serial(A3, UART_BAUD)
 
-
-    if SMBus is not None:
-        try:
-            i2c_bus = SMBus(I2C_BUS_NO)
-            rospy.loginfo(f"[I2C] bus {I2C_BUS_NO} ready, A2=0x{I2C_ADDR2:02X}, A3=0x{I2C_ADDR3:02X}")
-        except Exception as e:
-            rospy.logwarn(f"[I2C] open fail: {e}")
-            i2c_bus = None
-    else:
-        rospy.logwarn("[I2C] smbus2 not installed; I2C control unavailable")
-
-    ok = run_mode1_sequence()
-    rospy.loginfo(f"mode 1 done, ok={ok}")
-
-    go_mode(distance)
-
-    sound_val = sound_data()  # 1: bad, 0: good, -1/None: invalid
-    if sound_val == 1:
-        sound_answer = "abnormal"
-    elif sound_val == 0:
-        sound_answer = "normal"
-    else:
-        sound_answer = None
-        rospy.loginfo("no valid sound result")
-
-    sound_pub = rospy.Publisher("/mode_result", String, queue_size=1)
-
-    if sound_answer is not None:
-        sound_pub.publish(String(data=sound_answer))
-    else:
-        rospy.logwarn("publish skipped (no valid result)")
-    rospy.sleep(0.5)
-    for_step_publish()
-
-
-    rate = rospy.Rate(20)
-
-    # this is for human control. now, we don't have a function to change manual_command, so this code never works.
-    # when auto control doesn't work, we have to revive this code.
+    # Publisher for result
+    if sound_pub is None:
+        sound_pub = rospy.Publisher("/mode_result", String, queue_size=1)
+        rospy.sleep(0.1)
+    if pillar_time_pub is None:
+        pillar_time_pub = rospy.Publisher("/pillar_up_time", Float32, queue_size=1)
+        rospy.sleep(0.1)
     
+    init_pub()
+
+    # Start keyboard emergency listener
+    #threading.Thread(target=keyboard_listener_thread, daemon=True).start()
+
+    rospy.on_shutdown(lambda: emergency_stop("shutdown"))
+
+
     try:
-        '''
-        while not rospy.is_shutdown():
-            cmd = None
-            with manual_lock:
-                if manual_command:
-                    cmd = manual_command
-                    manual_command = None
+        should_stop = False
 
-            if cmd == "go":
-                rospy.loginfo("[Manual] GO")
-                go_mode(distance)
-            elif cmd == "pillar_stop":
-                i2c_send_text(I2C_ADDR2, "PILLAR_STOP")
-            elif cmd == "quit":
-                rospy.loginfo("[Manual] QUIT")
-                quit_mode()
-                break
+        if not _emergency_evt.is_set():
+            ok = run()
+            rospy.loginfo(f"mode 1 sequence done, ok={ok}")
+            if rospy.is_shutdown() or _emergency_evt.is_set() or (not ok):
+                should_stop = True
 
-            rate.sleep()
-        '''
-        pass
+        if not _emergency_evt.is_set():
+            try:
+                # go_mode remains managed by arm_control (A1)
+                go_mode(A1_SER, should_stop=lambda: _emergency_evt.is_set())
+            except Exception as e:
+                rospy.logwarn(f"go_mode failed: {e}")
+
+        if not _emergency_evt.is_set():
+            # Example HIT flow (A1 handled inside arm_control)
+            uart_send(A1_SER, "HIT")
+            # sound_val = sound_data()   # if you want the real classification
+            # sound_answer = "abnormal" if sound_val == 1 else ("normal" if sound_val == 0 else None)
+            sound_answer = "abnormal"
+            if sound_answer is not None:
+                sound_pub.publish(String(data=sound_answer))
+            else:
+                rospy.logwarn("publish skipped (no valid result)")
+            rospy.sleep(0.5)
+
+        r = rospy.Rate(10)
+        while not rospy.is_shutdown() and not _emergency_evt.is_set():
+            r.sleep()
     finally:
-        try: close_arduino()
-        except: pass
+        # Close UARTs
         try:
-            if uart1_ser and uart1_ser.is_open:
-                uart1_ser.close()
-        except: pass
-        try:
-            if i2c_bus: i2c_bus.close()
-        except: pass
+            if A1_SER: close_serial(A1_SER)
+            if A2_SER: close_serial(A2_SER)
+            if A3_SER: close_serial(A3_SER)
+        except Exception:
+            pass
         rospy.loginfo("mode1_node exit")
+
 if __name__ == '__main__':
-    try:
-        main()
-    except KeyboardInterrupt:
-        pass
+    main()
