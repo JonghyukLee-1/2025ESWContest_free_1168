@@ -1,295 +1,403 @@
 #!/home/tunnel/jetson_project/yolov_env/bin/python
+# -*- coding: utf-8 -*-
+"""
+mode2_node.py
+
+Purpose:
+- Safe ABNORMAL retreat (ultrasonic-backed backoff)
+- Pre-position to (r=0, theta=-90)
+- Capture (r,theta) path via YOLO segmentation and follow it
+- Return to (r=0, theta=-90)
+- Publish "done" to /mode_result for mode_selector
+
+Key changes in this version:
+1) Segment-wise dynamic speeds from XY path spacing:
+   - For each (r,theta) segment, compute an arc length s in XY (polar metric)
+   - Given target XY speed v_xy_des, set segment time t = s / v
+   - Command speeds:
+        r_speed  = |짜횆r| / t      [cm/s]
+        th_speed = |짜횆짜챔| / t      [deg/s]
+   - Apply min/max caps separately to r and 짜챔 speeds
+
+2) Hardware slowness calibration is applied only to SLEEP time:
+   - r_time_scale and th_time_scale inflate the waiting time,
+     so the firmware completes moves without blocking on unrealistic timing.
+   - The commanded speeds still follow the path spacing policy.
+
+3) Safer UART send (guard None), keyboard emergency-stop, and ROS params.
+"""
+
+import sys
 import time
+import math
 import threading
-import serial
-import re
-import Jetson.GPIO as GPIO
-
-from smbus2 import SMBus
 import rospy
-from std_msgs.msg import String, Int32
-from camera_path import capture_path_rtheta_validated
+from std_msgs.msg import String
 
+from camera_path import capture_path_rtheta
+from arm_control import (
+    open_serial, close_serial,
+    abnormal_mode, quit_mode, uart_send, init_pub
+)
+
+# ==============================
+# UART configuration
+# ==============================
+A1 = "/dev/ttyACM0"  # Arm Arduino (1: radial r, 2: theta)
+A2 = "/dev/ttyACM1"  # Pillar Arduino (up/down/pillar_stop)
+A3 = "/dev/ttyTHS1"  # Car   Arduino (drive: w/s/q, bxx)
+UART_BAUD = 9600
+
+# Serial handles (opened in main)
+A1_SER = None
+A2_SER = None
+A3_SER = None
+
+# ==============================
+# Emergency handling
+# ==============================
+_emergency_evt = threading.Event()
+ser_lock = threading.Lock()  # serialize UART writes
+
+def emergency_stop(reason="keyboard"):
+    """Hard stop for all controllable modules."""
+    try:
+        _emergency_evt.set()
+        rospy.logwarn(f"[EMERGENCY] stop triggered ({reason})")
+        try:
+            if A1_SER:
+                quit_mode(A1_SER)                # tell arm Arduino to quit current mode
+            if A2_SER:
+                uart_send(A2_SER, "pillar_stop") # stop pillar
+            if A3_SER:
+                uart_send(A3_SER, "q")           # car quit
+        except Exception as e:
+            rospy.logwarn(f"[EMERGENCY] UART notify failed: {e}")
+    except Exception as e:
+        rospy.logwarn(f"[EMERGENCY] unexpected error: {e}")
+
+"""
+def keyboard_listener_thread():
+    #Type 'q' + Enter in this terminal to trigger emergency stop.
+    rospy.loginfo("[KEY] Listener started (type 'q' + Enter to emergency-stop)")
+    while not rospy.is_shutdown():
+        try:
+            line = sys.stdin.readline()
+            if not line:
+                time.sleep(0.05)
+                continue
+            if line.strip().lower() == "q":
+                emergency_stop("keyboard:q")
+        except Exception as e:
+            rospy.logwarn(f"[KEY] error: {e}")
+            time.sleep(0.1)
+"""
+
+# ==============================
+# ROS param helper
+# ==============================
 def P(name, default):
     return rospy.get_param("~" + name, default)
 
-_NUM_RE = re.compile(r'^-?\d+(\.\d+)?$')
+# ==============================
+# Runtime parameters (loaded in main)
+# ==============================
+# Target XY speed (used to split speeds between r and 짜챔 per segment)
+v_xy_des_cm_s   = None  # [cm/s]
 
-def _parse_distance(line: str):
-    line = line.strip()
-    if not line:
-        return None
-    token = line.split(",", 1)[1].strip() if line.startswith("DIST,") else line
-    if not _NUM_RE.match(token):
-        return None
+# Speed caps for r and 짜챔 (commanded to firmware)
+r_speed_min     = None  # [cm/s]
+r_speed_max     = None  # [cm/s]
+th_speed_min    = None  # [deg/s]
+th_speed_max    = None  # [deg/s]
+
+# Hardware slowness calibration (applied to sleep time only)
+r_time_scale    = None  # (>=1.0 징챈 slower hardware)
+th_time_scale   = None  # (>=1.0 징챈 slower hardware)
+wait_pillar = None      # (pillar up/down to capture the tile segment)
+
+# Extra slack after each segment
+safety_margin_s = None  # [s]
+
+# Model & publishers
+model_path      = None
+pub_done        = None
+
+# (Deprecated) legacy fixed speeds (kept for compatibility but unused in segment motion)
+r_cmd_speed     = None
+th_cmd_speed    = None
+
+# ==============================
+# UART helpers
+# ==============================
+def send_move(ser, motor_id, direction, speed, distance):
+    """
+    Send one move command to Arduino motor controller.
+
+    Args:
+        motor_id  : 1 for radial (r), 2 for theta
+        direction : 'F' or 'B'
+        speed     : speed value (cm/s for r, deg/s for 짜챔)
+        distance  : magnitude (cm for r, deg for 짜챔)
+    """
+    if ser is None:
+        rospy.logwarn("[move] serial handle is None; skip cmd")
+        return
+    cmd = f"{motor_id},{direction},{speed:.2f},{distance:.2f}"
+    rospy.loginfo(f"[TX] {cmd}")
+    with ser_lock:
+        uart_send(ser, cmd)
+
+def _segment_arc_len(r0, th0_deg, r1, th1_deg):
+    """
+    Compute "polar arc length" between (r0,짜챔0) and (r1,짜챔1) as an XY proxy.
+
+    Using polar metric:
+        s = sqrt( (짜횆r)^2 + (r_avg^2)(짜횆짜챔_rad^2) )
+
+    Returns:
+        s_cm    : arc length in [cm]
+        dr     : r1 - r0 [cm]
+        dth_deg: 짜챔1 - 짜챔0 [deg]
+    """
+    dr = float(r1) - float(r0)
+    dth_deg = float(th1_deg) - float(th0_deg)
+    dth_rad = math.radians(dth_deg)
+    r_avg = 0.5 * (float(r0) + float(r1))
+    s_cm = math.hypot(dr, r_avg * dth_rad)
+    return s_cm, dr, dth_deg
+
+# ==============================
+# Motion core: segment-wise dynamic speed
+# ==============================
+def move(path, r_start, theta_start, visualize=False):
+    """
+    Follow a sequence of (r,짜챔) waypoints.
+
+    Policy:
+      - For each segment, compute polar arc length s.
+      - With target XY speed v_xy_des_cm_s, set t_nom = s / v.
+      - Command speeds:
+            r_speed  = |짜횆r| / t_nom [cm/s]
+            th_speed = |짜횆짜챔| / t_nom [deg/s]
+      - Apply [min, max] caps separately for r and 짜챔.
+      - Sleep time considers hardware slowness factors (r_time_scale, th_time_scale)
+        plus a safety margin.
+    """
+    # Normalize to list
+    if isinstance(path, tuple):
+        path = [path]
+
+    curr_r, curr_th = float(r_start), float(theta_start)
+
+    for (r_next, th_next) in path:
+        if _emergency_evt.is_set() or rospy.is_shutdown():
+            break
+
+        r_next  = float(r_next)
+        th_next = float(th_next)
+
+        # 1) Compute segment length and increments
+        s_cm, dr, dth_deg = _segment_arc_len(curr_r, curr_th, r_next, th_next)
+        if s_cm < 1e-6 and abs(dr) < 1e-6 and abs(dth_deg) < 1e-6:
+            curr_r, curr_th = r_next, th_next
+            continue
+
+        # 2) Segment nominal duration (minimum clamp for numerics)
+        v = max(float(v_xy_des_cm_s), 1e-6)
+        t_nom = max(s_cm / v, 0.05)  # at least 50 ms for stability
+
+        # 3) Command speeds from spacing
+        r_speed_cmd  = abs(dr) / t_nom                      # [cm/s]
+        th_speed_cmd = abs(dth_deg) / t_nom                 # [deg/s]
+
+        # 4) Apply caps
+        if r_speed_max > 0.0:
+            r_speed_cmd = min(max(r_speed_cmd, r_speed_min), r_speed_max)
+        if th_speed_max > 0.0:
+            th_speed_cmd = min(max(th_speed_cmd, th_speed_min), th_speed_max)
+
+        # 5) Determine directions
+        dir_r  = 'F' if dr >= 0.0 else 'B'
+        dir_th = 'F' if dth_deg >= 0.0 else 'B'
+
+        # 6) Send motor commands (use absolute distance)
+        if abs(dr) > 0.0:
+            send_move(A1_SER, 1, dir_r,  r_speed_cmd,  abs(dr))
+        if abs(dth_deg) > 0.0:
+            send_move(A1_SER, 2, dir_th, th_speed_cmd, abs(dth_deg))
+
+        # 7) Sleep long enough for both axes to realistically finish
+        #    (only sleep time is scaled by hardware slowness)
+        t_r  = (abs(dr)      / max(r_speed_cmd,  1e-6)) * float(r_time_scale) if abs(dr)      > 0.0 else 0.0
+        t_th = (abs(dth_deg) / max(th_speed_cmd, 1e-6)) * float(th_time_scale) if abs(dth_deg) > 0.0 else 0.0
+        time.sleep(max(t_r, t_th, 0.10) + float(safety_margin_s))
+
+        # 8) Update pose
+        curr_r, curr_th = r_next, th_next
+
+    # NOTE: visualize option intentionally omitted (non-blocking autonomy)
+    return curr_r, curr_th
+
+# ==============================
+# Cleanup and result publish
+# ==============================
+def publish_results_and_cleanup():
+    """Gracefully stop modules and publish 'done'."""
     try:
-        return float(token)
-    except:
-        return None
+        if A1_SER:
+            quit_mode(A1_SER)
+        if A2_SER:
+            uart_send(A2_SER, "pillar_stop")
+        if pub_done:
+            pub_done.publish(String(data="done"))
+    except Exception as e:
+        rospy.logwarn(f"[mode2] cleanup error: {e}")
 
-class Arduino1:
-    def __init__(self, port="/dev/ttyACM0", baud=9600):
-        self.ser = serial.Serial(port, baudrate=baud, timeout=0.1)
-        time.sleep(2.0)
+# ==============================
+# Main behavior sequence
+# ==============================
+def run():
+    try:
+        # 1) ABNORMAL retreat (uses ultrasonic to safely back off)
+        rospy.loginfo("[mode2] abnormal_mode()")
+        abnormal_mode(A1_SER, should_stop=lambda: _emergency_evt.is_set())
 
-    def send_text(self, text: str):
-        self.ser.write((text.strip() + "\n").encode())
-        time.sleep(0.02)
 
-    def send_move(self, motor_id: int, direction: str, speed: float, distance: float):
-        self.ser.write(f"{motor_id},{direction},{speed:.2f},{distance:.2f}\n".encode())
-        time.sleep(0.05)
 
-    def close(self):
-        try:
-            self.ser.close()
-        except:
-            pass
+        # 2) Small nudge to a capture-friendly pose (optional)
+        uart_send(A2_SER, "down")
+        move((8.0, 90.0), r_start=0.0, theta_start=90.0, visualize=False)
+        rospy.sleep(wait_pillar)
+        uart_send(A2_SER, "pillar_stop")
 
-class Arduino2I2C:
-    def __init__(self, bus_id=0, addr=0x08):
-        self.bus = SMBus(bus_id)
-        self.addr = addr
+        # 3) Capture path via YOLO segmentation (non-blocking debug view)
+        rospy.loginfo("[mode2] capturing path...")
+        path = capture_path_rtheta(
+            model_path=model_path,
+            cam_index=0,
+            conf_thr=0.7,
+            step_px=8.0,
+            cx=None, cy=None,
+            px2cm_x=0.1,
+            px2cm_y=0.1,
+            device="cpu",
+            timeout_open_s=10.0,
+            max_attempts=10,
+            timeout_detect_s=8.0,
+            min_points=12,
+            debug_view=True
+        )
 
-    def _send(self, text: str):
-        payload = bytearray(text.encode()[:31])
-        length = len(payload)
-        self.bus.write_i2c_block_data(self.addr, length, list(payload))
-        time.sleep(0.02)
+        # Return to center radius before starting (optional)
+        uart_send(A2_SER, "up")
+        move((0.0, 90.0), r_start=8.0, theta_start=90.0, visualize=False)
+        rospy.sleep(wait_pillar)
+        uart_send(A2_SER, "pillar_stop")
 
-    def shoot(self, ms: int):
-        self._send(f"shoot,{int(ms)}")
+        if not path:
+            rospy.logwarn("[mode2] empty path. cleanup.")
+            return False
 
-    def shoot_stop(self):
-        self._send("shoot_stop")
+        # 4) Pre-position to (r=0, 짜챔=-90)
+        move((0.0, 90.0), r_start=0.0, theta_start=-90.0, visualize=False)
 
-    def close(self):
-        try:
-            self.bus.close()
-        except:
-            pass
+        # 5) Follow captured path (assumed to start near 짜챔 = 90deg; adjust if needed)
+        r_last, theta_last = move(path, r_start=0.0, theta_start=90.0, visualize=False)
 
-class Mode2Node:
-    _SEQ = [
-        [1,0,0,0],[1,1,0,0],[0,1,0,0],[0,1,1,0],
-        [0,0,1,0],[0,0,1,1],[0,0,0,1],[1,0,0,1],
-    ]
+        # 6) Return to (r=0, 짜챔=-90)
+        move((0.0, -90.0), r_start=r_last, theta_start=theta_last, visualize=False)
+        rospy.loginfo("[mode2] finished path following.")
 
-    def __init__(self):
-        rospy.init_node("mode2_node")
-        self.i2c_bus_id   = P("i2c_bus", 0)
-        self.i2c_addr     = P("i2c_address", 0x08)
-        self.linear_speed = P("linear_speed_cm_s", 3.0)
-        self.theta_scale  = P("theta_speed_scale", 3.0)
-        self.segment_pad  = P("segment_settle_sec", 0.5)
-        self.shoot_ms     = P("shoot_ms", 800)
-        self.model_path   = P("model_path", "/home/tunnel/Desktop/riot/best.pt")
-        self.cam_index    = P("camera_index", 0)
-        self.conf_thr     = P("conf", 0.7)
-        self.step_px      = P("step_px", 5.0)
-        self.cx           = P("cx", 0.0)
-        self.cy           = P("cy", 0.0)
-        self.px2cm_x      = P("px2cm_x", 1.0)
-        self.px2cm_y      = P("px2cm_y", 1.0)
-        self.device       = P("device", "cuda:0")
-        self.sort_from_90 = P("sort_from_90", True)
-        self.dist_poll_period       = P("distance_poll_sec", 0.05)
-        self.abnormal_timeout_s     = P("abnormal_timeout_sec", 12.0)
-        self.abnormal_dist_threshold= P("abnormal_dist_threshold_cm", 10.0)
-        self.max_ab_steps           = P("max_ab_steps", 3000)
-        self.initial_r     = P("initial_r", 0.0)
-        self.initial_theta = P("initial_theta", -90.0)
-        self.pre_r         = P("pre_r", 0.0)
-        self.pre_theta     = P("pre_theta", 90.0)
-        self.post_r        = P("post_r", 0.0)
-        self.post_theta    = P("post_theta", -90.0)
-        self.IN1 = P("stepper_in1_bcm", 17)
-        self.IN2 = P("stepper_in2_bcm", 18)
-        self.IN3 = P("stepper_in3_bcm", 27)
-        self.IN4 = P("stepper_in4_bcm", 22)
-        self.cm_per_step = P("cm_per_step", 1.0/450.0)
-        self.stepper_speed_cm_s = P("stepper_speed_cm_s", 2.0)
-        self.pub_done     = rospy.Publisher("/mode_result", String, queue_size=1, latch=True)
-        self.pub_ab_steps = rospy.Publisher("/steps", Int32,  queue_size=1, latch=True)
-        self.a1 = Arduino1(self.serial_port, self.serial_baud)
-        self.a2 = Arduino2I2C(self.i2c_bus_id, self.i2c_addr)
-        self._ab_steps = 0
-        self._ser_lock = threading.Lock()
-        GPIO.setwarnings(False)
-        GPIO.setmode(GPIO.BCM)
-        for pin in [self.IN1, self.IN2, self.IN3, self.IN4]:
-            GPIO.setup(pin, GPIO.OUT)
-            GPIO.output(pin, 0)
+        # Idle until shutdown or emergency
+        r = rospy.Rate(5)
+        while not rospy.is_shutdown() and not _emergency_evt.is_set():
+            r.sleep()
 
-    def safe_send_text(self, text: str, sleep_after=0.02):
-        with self._ser_lock:
-            self.a1.send_text(text)
-        if sleep_after > 0:
-            time.sleep(sleep_after)
+        return True
 
-    def safe_send_move(self, motor_id: int, direction: str, speed: float, distance: float, sleep_after=0.05):
-        with self._ser_lock:
-            self.a1.send_move(motor_id, direction, speed, distance)
-        if sleep_after > 0:
-            time.sleep(sleep_after)
+    finally:
+        publish_results_and_cleanup()
 
-    def _clear_input_buffer(self):
-        with self._ser_lock:
-            try:
-                n = self.a1.ser.in_waiting
-                if n:
-                    self.a1.ser.read(n)
-            except:
-                pass
-
-    def _coils_off(self):
-        for pin in [self.IN1, self.IN2, self.IN3, self.IN4]:
-            GPIO.output(pin, 0)
-
-    def _speed_to_delay(self, speed_cm_s: float) -> float:
-        steps_per_s = speed_cm_s / max(self.cm_per_step, 1e-9)
-        return max(0.002, 1.0 / steps_per_s)
-
-    def _step_once(self, direction: int, delay_s: float):
-        seq = self._SEQ if direction >= 0 else list(reversed(self._SEQ))
-        for pat in seq:
-            GPIO.output(self.IN1, pat[0])
-            GPIO.output(self.IN2, pat[1])
-            GPIO.output(self.IN3, pat[2])
-            GPIO.output(self.IN4, pat[3])
-            time.sleep(delay_s)
-
-    def _read_distance_locked(self, max_wait=None):
-        if max_wait is None:
-            max_wait = self.dist_poll_period
-        t0 = time.time()
-        with self._ser_lock:
-            try:
-                n = self.a1.ser.in_waiting
-                if n:
-                    self.a1.ser.read(n)
-            except:
-                pass
-            while (time.time() - t0) < max_wait and not rospy.is_shutdown():
-                try:
-                    line = self.a1.ser.readline().decode('utf-8', errors='ignore')
-                    if not line:
-                        time.sleep(0.01)
-                        continue
-                    val = _parse_distance(line)
-                    if val is not None:
-                        return val
-                except:
-                    time.sleep(0.02)
-                    break
-        return None
-
-    def _send_delta_move(self, dr, dth):
-        if abs(dr) > 1e-6:
-            self.safe_send_move(1, 'F' if dr >= 0 else 'B', self.linear_speed, abs(dr))
-        if abs(dth) > 1e-6:
-            self.safe_send_move(2, 'F' if dth >= 0 else 'B', self.linear_speed * self.theta_scale, abs(dth))
-
-    def _estimate_move_time(self, abs_dr, abs_dth):
-        t_r  = (abs_dr  / max(self.linear_speed, 1e-6)) if abs_dr  > 0 else 0.0
-        t_th = (abs_dth / max(self.linear_speed * self.theta_scale, 1e-6)) if abs_dth > 0 else 0.0
-        return max(t_r, t_th, 0.1)
-
-    def _abnormal_move_until_distance_and_count(self):
-        rospy.loginfo("[mode2] send 'abnormal' to Arduino1")
-        self.safe_send_text("ABNORMAL", sleep_after=0.05)
-        self._ab_steps = 0
-        delay = self._speed_to_delay(self.stepper_speed_cm_s)
-        thr = self.abnormal_dist_threshold
-        deadline = time.time() + self.abnormal_timeout_s
-        rospy.loginfo(f"[mode2] (local abnormal) backward until distance > {thr:.1f}cm")
-        while not rospy.is_shutdown() and time.time() < deadline:
-            self._step_once(direction=-1, delay_s=delay)
-            self._ab_steps += 1
-            val = self._read_distance_locked(max_wait=self.dist_poll_period)
-            if val is not None and val > thr:
-                rospy.loginfo(f"[mode2] distance {val:.2f} > {thr:.1f} ¡æ stop local abnormal")
-                break
-            if self._ab_steps >= self.max_ab_steps:
-                rospy.logwarn("[mode2] max_ab_steps reached ¡æ stop local abnormal")
-                break
-        self._coils_off()
-        self.safe_send_text("STOP", sleep_after=0.05)
-        self._clear_input_buffer()
-
-    def _publish_results_and_cleanup(self):
-        self.pub_ab_steps.publish(Int32(self._ab_steps))
-        rospy.loginfo(f"[mode2] published ab_steps={self._ab_steps} on {self.pub_ab_steps.resolved_name}")
-        rospy.loginfo(f"[mode2] published 'done' on {self.pub_done.resolved_name}")
-        self.safe_send_text("STOP", sleep_after=0.02)
-        self.a2.shoot_stop()
-        self.safe_send_text("QUIT", sleep_after=0.02)
-        self.pub_done.publish("done")
-
-    def run(self):
-        try:
-            self._abnormal_move_until_distance_and_count()
-            dr0  = self.pre_r - self.initial_r
-            dth0 = self.pre_theta - self.initial_theta
-            rospy.loginfo(f"[mode2] pre-position to ({self.pre_r:.2f}, {self.pre_theta:.2f}) (¥Är={dr0:.2f}, ¥Ä¥è={dth0:.2f})")
-            self._send_delta_move(dr0, dth0)
-            time.sleep(self._estimate_move_time(abs(dr0), abs(dth0)) + self.segment_pad)
-            rospy.loginfo("[mode2] capturing path (validated one-shot)...")
-            path = capture_path_rtheta_validated(
-                model_path=self.model_path,
-                cam_index=self.cam_index,
-                conf_thr=self.conf_thr,
-                step_px=self.step_px,
-                cx=(None if self.cx == 0.0 else self.cx),
-                cy=(None if self.cy == 0.0 else self.cy),
-                px2cm_x=self.px2cm_x,
-                px2cm_y=self.px2cm_y,
-                do_sort_from_90=self.sort_from_90,
-                device=self.device,
-                max_attempts=P("max_attempts", 10),
-                timeout_s=P("capture_timeout_sec", 8.0),
-                min_points=P("min_points", 16),
-                debug_view=P("debug_view", False)
-            )
-            if not path:
-                rospy.logwarn("[mode2] empty path. cleanup.")
-                self._publish_results_and_cleanup()
-                return
-            prev_r, prev_th = self.pre_r, self.pre_theta
-            for idx, (r, th) in enumerate(path, start=1):
-                dr  = r  - prev_r
-                dth = th - prev_th
-                self._send_delta_move(dr, dth)
-                move_time = self._estimate_move_time(abs(dr), abs(dth))
-                time.sleep(move_time + self.segment_pad)
-                rospy.loginfo(f"[mode2] shoot {self.shoot_ms}ms @ point {idx}/{len(path)}")
-                self.a2.shoot(self.shoot_ms)
-                time.sleep(min(self.shoot_ms/1000.0, 0.2))
-                prev_r, prev_th = r, th
-            drp  = self.post_r - prev_r
-            dthp = self.post_theta - prev_th
-            rospy.loginfo(f"[mode2] post-position to ({self.post_r:.2f}, {self.post_theta:.2f}) (¥Är={drp:.2f}, ¥Ä¥è={dthp:.2f})")
-            self._send_delta_move(drp, dthp)
-            time.sleep(self._estimate_move_time(abs(drp), abs(dthp)) + self.segment_pad)
-            self._publish_results_and_cleanup()
-            rospy.loginfo("[mode2] finished. Ctrl+C to exit.")
-            rate = rospy.Rate(5)
-            while not rospy.is_shutdown():
-                rate.sleep()
-        finally:
-            try:
-                GPIO.cleanup()
-            except:
-                pass
-            self.a2.close()
-            self.a1.close()
-
+# ==============================
+# ROS node entry
+# ==============================
 def main():
-    node = Mode2Node()
-    node.run()
+    rospy.init_node("mode2_node")
+
+    global v_xy_des_cm_s, r_speed_min, r_speed_max, th_speed_min, th_speed_max, wait_pillar
+    global r_time_scale, th_time_scale, safety_margin_s, r_cmd_speed, th_cmd_speed
+    global model_path, pub_done, A1_SER, A2_SER
+
+
+    # ---- Load parameters (tunable at runtime) ----
+    # Target XY speed for segment timing
+    v_xy_des_cm_s = float(P("v_xy_des_cm_s", 2.5))  # [cm/s]
+
+    # Speed caps
+    r_speed_min  = float(P("r_speed_min", 0.5))     # [cm/s]
+    r_speed_max  = float(P("r_speed_max", 1.4))     # [cm/s]
+    th_speed_min = float(P("th_speed_min", 5.0))    # [deg/s]
+    th_speed_max = float(P("th_speed_max", 10.0))   # [deg/s]
+
+    # Hardware-time scaling (sleep only)
+    r_time_scale  = float(P("r_time_scale", 1.3))
+    th_time_scale = float(P("th_time_scale", 1.2))  # e.g., 180deg: ~21s vs ~6s 징챈 ~3.5x
+    wait_pillar = float(P("wait_pillar", 10.0))
+
+    # Extra slack per segment
+    safety_margin_s = float(P("safety_margin_s", 0.3))
+
+    # Model file path
+    model_path = P("model_path", "/home/tunnel/Desktop/riot/best.pt")
+
+    # (Deprecated) legacy fixed speeds (kept for compatibility but not used in segment motion)
+    r_cmd_speed  = float(P("r_cmd_speed", 3.0))
+    th_cmd_speed = float(P("th_cmd_speed", 30.0))
+
+    # Publisher
+    pub_done = rospy.Publisher("/mode_result", String, queue_size=1, latch=True)
+
+    # Open UARTs
+    A1_SER = open_serial(A1, UART_BAUD)
+    A2_SER = open_serial(A2, UART_BAUD)
+    # A3 (car) is optional in this mode; open if you need it:
+    # A3_SER = open_serial(A3, UART_BAUD)
+
+    # Optional: publish step counts from arm_control (already set there)
+    init_pub()
+
+    # Keyboard emergency listener
+    #threading.Thread(target=keyboard_listener_thread, daemon=True).start()
+
+    rospy.on_shutdown(lambda: emergency_stop("shutdown"))
+
+    try:
+        if not _emergency_evt.is_set():
+            ok = run()
+            rospy.loginfo(f"mode 2 sequence done, ok={ok}")
+
+        # Keep node alive for supervisor unless emergency/shutdown
+        r = rospy.Rate(10)
+        while not rospy.is_shutdown() and not _emergency_evt.is_set():
+            r.sleep()
+
+    finally:
+        # Best-effort cleanup
+        try:
+            if A1_SER:
+                close_serial(A1_SER)
+            if A2_SER:
+                close_serial(A2_SER)
+            if A3_SER:
+                close_serial(A3_SER)
+        except Exception:
+            pass
+        rospy.loginfo("mode2_node exit")
 
 if __name__ == "__main__":
-    try:
-        main()
+    main()
+    """
     except KeyboardInterrupt:
-        pass
+        emergency_stop("KeyboardInterrupt")
+    """
