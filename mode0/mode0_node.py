@@ -87,15 +87,53 @@ def move_servo_auto():
 
 def move_car_forward():
     """
-    Move the car forward for 2 seconds,
-    then stop (send 'w' then 'q').
+    Pre-steer once using a 3-sample median to suppress spikes,
+    then do: 'w' for 2.0 s -> 'q' for 0.2 s.
     """
     if stop_event or manual_mode:
         return
-    uart_send(A3, 'w')
-    time.sleep(2.0)
-    uart_send(A3, 'q')
-    time.sleep(0.2)
+
+    # Thresholds (tune as needed)
+    NEAR_CM, FAR_CM, EMERGENCY_CM = 13.0, 16.0, 10.0
+    STEER_PULSE_S = 1.0  # brief steer, then neutralize
+
+    # --- burst: take 3 quick samples ---
+    samples, emerg = [], 0
+    for _ in range(3):
+        d = listen_from_arduino(A1, max_wait=0.1)
+        if d is not None:
+            samples.append(d)
+            if d <= EMERGENCY_CM: emerg += 1
+        time.sleep(0.03)
+
+    # Emergency: require 징횄2 confirmations
+    if emerg >= 2:
+        rospy.logwarn(f"[AUTO] EMERGENCY -> stop (samples={samples})")
+        uart_send(A3, 'q'); time.sleep(0.1)
+        uart_send(A3, 'stop')
+        globals()['stop_event'] = True
+        return
+
+    # Pre-steer using median (if we have any sample)
+    if samples:
+        med = sorted(samples)[len(samples)//2]
+        if med < NEAR_CM:
+            rospy.loginfo(f"[AUTO] median={med:.2f} -> pre-steer RIGHT")
+            uart_send(A3, 'd'); time.sleep(STEER_PULSE_S)
+            uart_send(A3, 'q'); time.sleep(0.1)
+        elif med > FAR_CM:
+            rospy.loginfo(f"[AUTO] median={med:.2f} -> pre-steer LEFT")
+            uart_send(A3, 'a'); time.sleep(STEER_PULSE_S)
+            uart_send(A3, 'q'); time.sleep(0.1)
+        else:
+            rospy.loginfo(f"[AUTO] median={med:.2f} -> no pre-steer")
+    else:
+        rospy.logwarn("[AUTO] no distance sample -> no pre-steer")
+
+    # Original forward window
+    if not stop_event and not manual_mode and not thermal_triggered:
+        uart_send(A3, 'w'); time.sleep(2.0)
+        uart_send(A3, 'q'); time.sleep(0.2)
 
 def _get_key():
     """Get one key press from stdin (non-blocking raw mode)."""
@@ -116,28 +154,40 @@ def keyboard_listener():
     - x: emergency stop
     - wasdq: direct motor control
     """
+    import sys, termios, tty, os
     global manual_mode, stop_event
-    rospy.loginfo("[KEY] Listener started")
-    while not rospy.is_shutdown():
-        k = _get_key()
-        if not k: continue
-        if k == '\x03': break  # Ctrl-C
-        key = k.lower()
 
-        if key == 'm':
-            manual_mode = not manual_mode
-            rospy.loginfo(f"[KEY] manual_mode={manual_mode}")
-            continue
-        if key == ' ':
-            uart_send(A3, 'q'); continue
-        if key == 'x':
-            stop_event = True
-            uart_send(A3, 'q'); time.sleep(0.2); uart_send(A3, 'stop')
-            rospy.logwarn("[KEY] Emergency stop"); continue
+    fd = sys.stdin.fileno()
+    orig = termios.tcgetattr(fd)
 
-        if key in ('w','a','s','d','q'):
-            if not manual_mode: manual_mode = True
-            uart_send(A3, key)
+    def restore():
+        try: termios.tcsetattr(fd, termios.TCSADRAIN, orig)
+        except: pass
+
+    try:
+        while not rospy.is_shutdown():
+            tty.setraw(fd)
+            ch = sys.stdin.read(1)
+            restore()
+
+            if ch == '\x03': break
+            key = ch.lower()
+
+            if key == 'm':
+                manual_mode = not manual_mode
+                rospy.loginfo(f"[KEY] manual_mode={manual_mode}")
+            elif key == ' ':
+                uart_send(A3, 'q')
+            elif key == 'x':
+                stop_event = True
+                uart_send(A3, 'q'); time.sleep(0.2); uart_send(A3, 'stop')
+            elif key in ('w','a','s','d','q'):
+                if not manual_mode: manual_mode = True
+                uart_send(A3, key)
+    finally:
+        restore()
+        os.system("stty sane")
+
 
 def auto_mode_loop():
     """
